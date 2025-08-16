@@ -1,3 +1,23 @@
+# Archivos de base de datos grandes
+*.mdb
+data/input/
+data/output/
+
+# Archivos de prueba y temporales
+test_*.py
+quick_*.py
+check_*.py
+view_*.py
+upload_*.py
+
+# Logs
+logs/
+*.log
+
+# Virtual environment
+venv/
+.venv/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
