@@ -3,12 +3,9 @@
 data/input/
 data/output/
 
-# Archivos de prueba y temporales
-test_*.py
-quick_*.py
-check_*.py
-view_*.py
-upload_*.py
+# Scripts de prueba y utilidades (no necesarios para producción)
+scripts/
+docs/
 
 # Logs
 logs/
