@@ -20,7 +20,7 @@ class Config:
         self.defaults = {
             'DEFAULT_OUTPUT_FORMAT': 'sql',
             'DEFAULT_TABLE_NAME': 'data_table',
-            'MAX_FILE_SIZE_MB': 100,
+            'MAX_FILE_SIZE_MB': 1024,  # Cambiado de 100 a 1024 (1GB)
             'LOG_LEVEL': 'INFO',
             'LOG_FILE': 'logs/converter.log'
         }

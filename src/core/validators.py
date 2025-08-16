@@ -16,7 +16,7 @@ class DataValidator:
     }
     
     def __init__(self):
-        self.max_file_size_mb = 100  # Tamaño máximo por defecto
+        self.max_file_size_mb = 1024  # Tamaño máximo por defecto
     
     def validate_file_path(self, file_path: str) -> bool:
         """Valida que el archivo existe y es accesible"""

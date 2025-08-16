@@ -17,6 +17,17 @@ import sys
 import os
 from datetime import datetime
 import json
+try:
+    from src.writers.mysql_writer import MySQLWriter
+    from src.ui.mysql_config import MySQLConfigUI
+    from src.utils.data_integrity import DataIntegrityChecker
+    MYSQL_AVAILABLE = True
+except ImportError as e:
+    print(f"MySQL features not available: {e}")
+    MYSQL_AVAILABLE = False
+    MySQLWriter = None
+    MySQLConfigUI = None
+    DataIntegrityChecker = None
 import time
 import subprocess
 
@@ -27,6 +38,105 @@ from src.core.converter import FileConverter
 from src.readers.robust_access_reader import RobustAccessReader
 from src.utils.logger import setup_logger
 from src.utils.config import Config
+
+# Inicializar componentes nuevos solo si están disponibles
+mysql_ui = MySQLConfigUI() if MYSQL_AVAILABLE and MySQLConfigUI else None
+integrity_checker = DataIntegrityChecker() if MYSQL_AVAILABLE and DataIntegrityChecker else None
+
+def convert_to_mysql_by_year(file_path, db_config, naming_config):
+    """
+    Convierte archivos Access por años y los sube directamente a MySQL
+    """
+    try:
+        # Inicializar writer de MySQL
+        mysql_writer = MySQLWriter(db_config)
+        
+        # Verificar conexión
+        test_result = mysql_writer.test_connection()
+        if not test_result['success']:
+            return {
+                'success': False,
+                'message': f'❌ Error: No se pudo conectar a MySQL - {test_result["message"]}',
+                'details': None
+            }
+        
+        # Inicializar conversor
+        converter = FileConverter()
+        
+        # Realizar conversión por años usando el método existente
+        result = converter.convert_access_by_year(
+            input_path=file_path,
+            output_format='sql',  # Generar SQL temporalmente
+            output_dir='/tmp',     # Directorio temporal
+            naming_config=naming_config
+        )
+        
+        if result['success']:
+            # Procesar cada archivo generado y subirlo a MySQL
+            uploaded_tables = []
+            failed_tables = []
+            
+            for file_info in result['files_created']:
+                file_path_sql = file_info['path']
+                table_name = Path(file_path_sql).stem
+                
+                try:
+                    # Leer el archivo SQL y ejecutarlo en MySQL
+                    with open(file_path_sql, 'r', encoding='utf-8') as f:
+                        sql_content = f.read()
+                    
+                    # Ejecutar en MySQL
+                    exec_result = mysql_writer.execute_sql(sql_content)
+                    
+                    if exec_result['success']:
+                        uploaded_tables.append({
+                            'name': table_name,
+                            'statements': exec_result['statements_executed']
+                        })
+                    else:
+                        failed_tables.append({
+                            'name': table_name,
+                            'error': exec_result.get('error', 'Error desconocido')
+                        })
+                    
+                    # Limpiar archivo temporal
+                    if os.path.exists(file_path_sql):
+                        os.remove(file_path_sql)
+                        
+                except Exception as table_error:
+                    failed_tables.append({
+                        'name': table_name,
+                        'error': str(table_error)
+                    })
+            
+            if uploaded_tables:
+                return {
+                    'success': True,
+                    'message': f'✅ {len(uploaded_tables)} tablas subidas exitosamente a MySQL',
+                    'details': {
+                        'database': db_config['database'],
+                        'host': db_config['host'],
+                        'tables_uploaded': uploaded_tables,
+                        'tables_failed': failed_tables,
+                        'total_success': len(uploaded_tables),
+                        'total_failed': len(failed_tables)
+                    }
+                }
+            else:
+                return {
+                    'success': False,
+                    'message': f'❌ Error: No se pudo subir ninguna tabla. {len(failed_tables)} errores.',
+                    'details': {'failed_tables': failed_tables}
+                }
+        else:
+            return result
+            
+    except Exception as e:
+        return {
+            'success': False,
+            'message': f'❌ Error durante conversión MySQL: {str(e)}',
+            'details': {'error': str(e)}
+        }
 
 # Configurar página con sidebar siempre visible
 st.set_page_config(
@@ -227,6 +337,10 @@ def main():
                 st.session_state.page = "📊 Resultados"
                 st.rerun()
             
+            if st.button("📅 Conversión por Años", use_container_width=True):
+                st.session_state.page = "📅 Conversión por Años"
+                st.rerun()
+            
             if st.button("⚙️ Configuración", use_container_width=True):
                 st.session_state.page = "⚙️ Configuración"
                 st.rerun()
@@ -335,6 +449,11 @@ def main():
         show_data_viewer()
     elif page == "📊 Resultados":
         show_results()
+    elif page == "📅 Conversión por Años":
+        if 'show_year_conversion' in globals():
+            show_year_conversion()
+        else:
+            st.error("La función de conversión por años no está disponible en esta ejecución. Guarda el archivo y recarga la app.")
     elif page == "⚙️ Configuración":
         show_configuration()
 
@@ -412,6 +531,56 @@ def show_converter():
         file_name = selected_file.split(" (")[0]
         file_path = f"data/input/{file_name}"
         
+        # Configuración de exportación
+        st.markdown("**Configuración de Exportación:**")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            export_formats = st.multiselect(
+                "Formatos de exportación",
+                options=["CSV", "Excel", "JSON", "MySQL"],
+                default=["CSV"],
+                help="Selecciona uno o más formatos de salida"
+            )
+        
+        with col2:
+            use_chunks = st.checkbox(
+                "Procesamiento por chunks",
+                value=False,
+                help="Recomendado para archivos >500MB"
+            )
+        
+        # Configuración de nombres si se selecciona algún formato
+        naming_config = {}
+        if export_formats:
+            with st.expander("🏷️ Personalización de Nombres", expanded=False):
+                if mysql_ui:
+                    naming_config = mysql_ui.render_naming_config()
+                else:
+                    st.info("🔧 Funcionalidad de personalización de nombres no disponible")
+                    naming_config = {}
+        
+        # Configuración MySQL si se selecciona
+        mysql_config = None
+        if "MySQL" in export_formats:
+            st.markdown("**🗄️ Configuración MySQL:**")
+            if mysql_ui:
+                mysql_config = mysql_ui.render_full_config()
+                
+                if not mysql_config:
+                    st.warning("⚠️ Configura la conexión MySQL para continuar")
+            else:
+                st.error("❌ Funcionalidad MySQL no disponible")
+                st.info("Para usar MySQL, asegúrate de que el módulo MySQL esté instalado y configurado")
+                # Remover MySQL de los formatos seleccionados
+                if "MySQL" in export_formats:
+                    export_formats.remove("MySQL")
+                st.warning("MySQL ha sido removido de los formatos de exportación")
+                # Continuar con otros formatos disponibles
+                if not export_formats:
+                    st.error("No hay formatos de exportación disponibles")
+                    return
         # Información del archivo
         with st.expander("Información del archivo"):
             try:
@@ -549,6 +718,15 @@ def show_converter():
         # Botón de conversión
         st.markdown("**Convertir:**")
         
+        # Botón de conversión mejorado
+        if st.button("🚀 Iniciar Conversión Mejorada", type="primary", use_container_width=True):
+            if not export_formats:
+                st.error("❌ Selecciona al menos un formato de exportación")
+            else:
+                convert_with_new_features(file_path, file_name, export_formats, naming_config, mysql_config, use_chunks)
+        
+        st.markdown("---")
+        st.markdown("**Conversión Original:**")        
         if st.button("🔄 Iniciar conversión de todas las tablas", type="primary"):
             # Verificar si es archivo Access
             is_access_file = file_name.lower().endswith(('.accdb', '.mdb'))
@@ -1166,6 +1344,384 @@ def show_configuration():
             default=[".csv", ".xlsx", ".xls", ".json", ".accdb", ".mdb"]
         )
 
+def show_year_conversion():
+    """Página de conversión por años"""
+    st.markdown("## 📅 Conversión por Años")
+    st.markdown("Convierte archivos Access (.mdb/.accdb) separando los datos por años")
+    
+    # Verificar archivos Access disponibles
+    input_files = get_input_files()
+    access_files = [f for f in input_files if f['name'].lower().endswith(('.mdb', '.accdb'))]
+    
+    if not access_files:
+        st.error("❌ No hay archivos Access disponibles")
+        st.write("Sube archivos .mdb o .accdb en la sección '📁 Convertir' o colócalos en `data/input/`")
+        return
+    
+    # Selección de archivo
+    st.markdown("### 📁 Seleccionar Archivo Access")
+    
+    file_options = [f"{f['name']} ({f['size']:.1f} MB)" for f in access_files]
+    selected_file = st.selectbox("Archivo Access:", file_options)
+    
+    if selected_file:
+        file_name = selected_file.split(" (")[0]
+        file_path = f"data/input/{file_name}"
+        
+        # Mostrar información del archivo
+        with st.expander("📊 Información del Archivo"):
+            try:
+                access_reader = RobustAccessReader()
+                year_summary = access_reader.get_year_summary(file_path)
+                
+                if 'error' in year_summary:
+                    st.error(f"Error analizando archivo: {year_summary['error']}")
+                else:
+                    st.success(f"✅ Archivo analizado correctamente")
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("Tamaño", f"{year_summary['file_size_mb']:.1f} MB")
+                        st.metric("Total de tablas", len(year_summary['tables']))
+                    
+                    with col2:
+                        total_rows = sum(t.get('total_rows', 0) for t in year_summary['tables'].values())
+                        st.metric("Total de filas", f"{total_rows:,}")
+                    
+                    # Mostrar detalles de tablas y años
+                    st.markdown("**📋 Tablas y Años Disponibles:**")
+                    for table_name, table_info in year_summary['tables'].items():
+                        if 'error' not in table_info:
+                            with st.expander(f"📊 {table_name}"):
+                                col1, col2, col3 = st.columns(3)
+                                with col1:
+                                    st.metric("Filas", f"{table_info['total_rows']:,}")
+                                with col2:
+                                    st.metric("Columnas", table_info['columns'])
+                                with col3:
+                                    st.metric("Años", table_info['year_count'])
+                                
+                                if table_info['available_years']:
+                                    st.write(f"**Años disponibles:** {', '.join(map(str, table_info['available_years']))}")
+                                    st.write(f"**Rango:** {table_info['year_range']}")
+                        else:
+                            st.error(f"Error en tabla {table_name}: {table_info['error']}")
+                            
+            except Exception as e:
+                st.error(f"Error analizando archivo: {str(e)}")
+        
+        # Configuración de conversión
+        st.markdown("### ⚙️ Configuración de Conversión")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            output_format = st.selectbox(
+                "Formato de salida:",
+                ["sql", "sqlite", "csv", "excel", "json"],
+                help="Formato de los archivos generados por año"
+            )
+        
+        with col2:
+            output_dir = st.text_input(
+                "Directorio de salida:",
+                value=f"data/output/{Path(file_name).stem}_por_años",
+                help="Directorio donde se guardarán los archivos por año"
+            )
+        
+        # Configuración de nombres para archivos por año
+        with st.expander("🏷️ Personalización de Nombres para Archivos por Año", expanded=False):
+            st.markdown("**Ejemplos de patrones disponibles:**")
+            st.markdown("- `at2-historico-{year}` → at2-historico-2008, at2-historico-2009...")
+            st.markdown("- `datos-{year}-v1` → datos-2008-v1, datos-2009-v1...")
+            st.markdown("- `backup-{year}` → backup-2008, backup-2009...")
+            
+            col3, col4 = st.columns(2)
+            
+            with col3:
+                year_prefix = st.text_input(
+                    "Prefijo personalizado:",
+                    value="",
+                    help="Prefijo que se añadirá antes del nombre. Usa {year} para incluir el año."
+                )
+                
+                use_year_timestamp = st.checkbox(
+                    "Incluir timestamp",
+                    value=False,
+                    help="Añadir fecha y hora al nombre del archivo"
+                )
+            
+            with col4:
+                year_suffix = st.text_input(
+                    "Sufijo personalizado:",
+                    value="",
+                    help="Sufijo que se añadirá después del nombre. Usa {year} para incluir el año."
+                )
+                
+                year_lowercase = st.checkbox(
+                    "Convertir a minúsculas",
+                    value=True,
+                    help="Convertir todos los nombres a minúsculas"
+                )
+            
+            # Crear configuración de nombres para años
+            naming_config = {
+                'table_prefix': year_prefix if year_prefix else None,
+                'table_suffix': year_suffix if year_suffix else None,
+                'use_timestamp': use_year_timestamp,
+                'lowercase_names': year_lowercase,
+                'replace_spaces': True,
+                'remove_special_chars': True
+            }
+            
+            # Vista previa del nombre generado
+            if year_prefix or year_suffix:
+                example_name = "ejemplo_tabla"
+                preview_year = 2008
+                
+                # Simular el nombre generado
+                preview_base = example_name.lower() if year_lowercase else example_name
+                
+                if year_prefix:
+                    prefix = year_prefix.replace('{year}', str(preview_year))
+                    preview_base = f"{prefix}{preview_base}"
+                else:
+                    preview_base = f"{preview_base}-{preview_year}"
+                    
+                if year_suffix:
+                    suffix = year_suffix.replace('{year}', str(preview_year))
+                    preview_base = f"{preview_base}{suffix}"
+                    
+                if use_year_timestamp:
+                    from datetime import datetime
+                    timestamp = datetime.now().strftime("_%Y%m%d_%H%M%S")
+                    preview_base = f"{preview_base}{timestamp}"
+                
+                st.info(f"📋 Vista previa: `{preview_base}.{output_format}`")
+        
+        # Configuración de Base de Datos en Línea
+        with st.expander("🌐 Conexión a Base de Datos en Línea", expanded=False):
+            st.markdown("**Conecta directamente a bases de datos remotas:**")
+            
+            # Selección de tipo de base de datos
+            db_type = st.selectbox(
+                "Tipo de Base de Datos:",
+                ["Ninguna (solo archivos)", "MySQL", "PostgreSQL", "Supabase"],
+                help="Selecciona el tipo de base de datos remota"
+            )
+            
+            db_config = None
+            
+            if db_type == "MySQL":
+                st.markdown("**🗄️ Configuración MySQL:**")
+                col5, col6 = st.columns(2)
+                
+                with col5:
+                    mysql_host = st.text_input("Host MySQL:", value="", placeholder="ejemplo: mysql.tuservidor.com")
+                    mysql_port = st.number_input("Puerto:", value=3306, min_value=1, max_value=65535)
+                    mysql_database = st.text_input("Base de datos:", value="", placeholder="nombre_base_datos")
+                
+                with col6:
+                    mysql_user = st.text_input("Usuario:", value="", placeholder="tu_usuario")
+                    mysql_password = st.text_input("Contraseña:", type="password", value="")
+                
+                if mysql_host and mysql_database and mysql_user and mysql_password:
+                    db_config = {
+                        'type': 'mysql',
+                        'host': mysql_host,
+                        'port': mysql_port,
+                        'database': mysql_database,
+                        'user': mysql_user,
+                        'password': mysql_password
+                    }
+                    
+                    if st.button("🔍 Probar Conexión MySQL"):
+                        try:
+                            from src.writers.mysql_writer import MySQLWriter
+                            mysql_writer = MySQLWriter(db_config)
+                            test_result = mysql_writer.test_connection()
+                            
+                            if test_result['success']:
+                                st.success(f"✅ Conexión exitosa: {test_result['message']}")
+                                if 'server_info' in test_result:
+                                    info = test_result['server_info']
+                                    st.info(f"🗄️ Servidor: {info.get('version', 'N/A')} | Base de datos: {info.get('database', 'N/A')}")
+                            else:
+                                st.error(f"❌ Error de conexión: {test_result['message']}")
+                                
+                        except Exception as e:
+                            st.error(f"❌ Error probando conexión: {str(e)}")
+            
+            elif db_type == "PostgreSQL":
+                st.markdown("**🐘 Configuración PostgreSQL:**")
+                col7, col8 = st.columns(2)
+                
+                with col7:
+                    pg_host = st.text_input("Host PostgreSQL:", value="", placeholder="ejemplo: postgres.tuservidor.com")
+                    pg_port = st.number_input("Puerto:", value=5432, min_value=1, max_value=65535)
+                    pg_database = st.text_input("Base de datos:", value="", placeholder="nombre_base_datos")
+                
+                with col8:
+                    pg_user = st.text_input("Usuario:", value="", placeholder="tu_usuario")
+                    pg_password = st.text_input("Contraseña:", type="password", value="")
+                
+                if pg_host and pg_database and pg_user and pg_password:
+                    db_config = {
+                        'type': 'postgresql',
+                        'host': pg_host,
+                        'port': pg_port,
+                        'database': pg_database,
+                        'user': pg_user,
+                        'password': pg_password
+                    }
+                    
+                    st.info("🔧 Funcionalidad PostgreSQL disponible próximamente...")
+            
+            elif db_type == "Supabase":
+                st.markdown("**⚡ Configuración Supabase:**")
+                col9, col10 = st.columns(2)
+                
+                with col9:
+                    supabase_url = st.text_input(
+                        "URL del Proyecto:", 
+                        value="", 
+                        placeholder="https://tuproyecto.supabase.co"
+                    )
+                
+                with col10:
+                    supabase_key = st.text_input(
+                        "Clave Anon:", 
+                        type="password", 
+                        value="",
+                        placeholder="tu-clave-anonima"
+                    )
+                
+                if supabase_url and supabase_key:
+                    db_config = {
+                        'type': 'supabase',
+                        'url': supabase_url,
+                        'key': supabase_key
+                    }
+                    
+                    st.info("🔧 Funcionalidad Supabase mejorada disponible próximamente...")
+            
+            # Información sobre proveedores recomendados
+            if db_type != "Ninguna (solo archivos)":
+                with st.expander("💡 Proveedores Recomendados de Bases de Datos", expanded=False):
+                    st.markdown("**MySQL en línea:**")
+                    st.markdown("- **PlanetScale** (gratis hasta 5GB): https://planetscale.com")
+                    st.markdown("- **Railway** (gratis con límites): https://railway.app")
+                    st.markdown("- **Aiven** (trial gratuito): https://aiven.io")
+                    st.markdown("- **DigitalOcean Managed Database**: https://digitalocean.com")
+                    
+                    st.markdown("**PostgreSQL en línea:**")
+                    st.markdown("- **Supabase** (gratis hasta 500MB): https://supabase.com")
+                    st.markdown("- **Neon** (gratis con límites): https://neon.tech")
+                    st.markdown("- **ElephantSQL** (gratis hasta 20MB): https://elephantsql.com")
+                    st.markdown("- **Render** (gratis con límites): https://render.com")
+                    
+                    st.markdown("**💰 Todos los proveedores ofrecen planes gratuitos perfectos para pruebas!**")
+        
+        # Botón de conversión
+        conversion_type = "a archivos" if not db_config else f"a {db_config['type'].upper()}"
+        
+        if st.button(f"🔄 Iniciar Conversión por Años {conversion_type}", type="primary", use_container_width=True):
+            try:
+                with st.spinner(f"🔄 Convirtiendo archivo por años {conversion_type}..."):
+                    # Crear conversor
+                    converter = FileConverter()
+                    
+                    # Realizar conversión
+                    if db_config and db_config['type'] == 'mysql':
+                        # Conversión directa a MySQL
+                        st.info("🗄️ Conectando a MySQL...")
+                        result = convert_to_mysql_by_year(file_path, db_config, naming_config)
+                    else:
+                        # Conversión a archivos
+                        result = converter.convert_access_by_year(
+                            input_path=file_path,
+                            output_format=output_format,
+                            output_dir=output_dir,
+                            naming_config=naming_config
+                        )
+                
+                # Mostrar resultados
+                success_msg = "✅ Conversión por años completada exitosamente!"
+                if db_config:
+                    success_msg += f" Los datos se han insertado en {db_config['type'].upper()}."
+                st.success(success_msg)
+                
+                # Resumen de resultados - Adaptado para MySQL y archivos
+                if db_config and db_config['type'] == 'mysql':
+                    # Resultados para MySQL
+                    details = result.get('details', {})
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Tablas subidas", details.get('total_success', 0))
+                    with col2:
+                        st.metric("Tablas fallidas", details.get('total_failed', 0))
+                    with col3:
+                        st.metric("Base de datos", details.get('database', 'N/A'))
+                    
+                    # Mostrar tablas subidas exitosamente
+                    if details.get('tables_uploaded'):
+                        st.markdown("### ✅ Tablas Subidas Exitosamente")
+                        for table_info in details['tables_uploaded']:
+                            st.success(f"📋 **{table_info['name']}** - {table_info['statements']} statements ejecutados")
+                    
+                    # Mostrar errores si los hay
+                    if details.get('tables_failed'):
+                        st.markdown("### ❌ Tablas con Errores")
+                        for table_error in details['tables_failed']:
+                            st.error(f"📋 **{table_error['name']}**: {table_error['error']}")
+                            
+                else:
+                    # Resultados para archivos tradicionales
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Archivos creados", result.get('total_files_created', 0))
+                    with col2:
+                        st.metric("Total de filas", f"{result.get('total_rows_converted', 0):,}")
+                    with col3:
+                        st.metric("Tamaño total", f"{result.get('total_size_mb', 0):.1f} MB")
+                
+                # Detalles de conversiones (solo para archivos)
+                if 'conversions_by_year' in result:
+                    st.markdown("### 📊 Detalles de Conversiones")
+                    
+                    successful_conversions = [conv for conv in result['conversions_by_year'].values() 
+                                           if conv['status'] == 'success']
+                    error_conversions = [conv for conv in result['conversions_by_year'].values() 
+                                       if conv['status'] == 'error']
+                    
+                    if successful_conversions:
+                        st.success(f"✅ **Conversiones exitosas:** {len(successful_conversions)}")
+                        
+                        # Tabla de resultados
+                        results_data = []
+                        for conv in successful_conversions:
+                            results_data.append({
+                                'Tabla': conv['table'],
+                                'Año': conv['year'],
+                                'Filas': f"{conv['rows_converted']:,}",
+                                'Archivo': conv['output_file'],
+                                'Tamaño (MB)': f"{conv.get('file_size_mb', 0):.1f}"
+                            })
+                        
+                        df_results = pd.DataFrame(results_data)
+                    st.dataframe(df_results, use_container_width=True)
+                
+                if error_conversions:
+                    st.error(f"❌ **Errores:** {len(error_conversions)}")
+                    for conv in error_conversions:
+                        st.error(f"Tabla {conv['table']}, Año {conv['year']}: {conv['error']}")
+                
+                # Enlace al directorio de salida
+                st.markdown(f"**📁 Archivos guardados en:** `{result['output_directory']}`")
+                
+            except Exception as e:
+                st.error(f"❌ Error durante la conversión: {str(e)}")
+                st.exception(e)
+
 def show_statistics():
     """Página de estadísticas"""
     st.markdown("## 📈 Estadísticas")
@@ -1255,3 +1811,369 @@ def get_success_rate():
 
 if __name__ == "__main__":
     main() 
+def convert_with_new_features(file_path, file_name, export_formats, naming_config, mysql_config, use_chunks):
+    """Función mejorada de conversión con soporte para MySQL, chunks e integridad"""
+    try:
+        # Inicializar componentes
+        access_reader = RobustAccessReader()
+        
+        # Verificar si DataIntegrityChecker está disponible
+        if MYSQL_AVAILABLE and DataIntegrityChecker:
+            integrity_checker = DataIntegrityChecker()
+        else:
+            integrity_checker = None
+            st.info("🔧 Verificación de integridad no disponible")
+        
+        # Verificar soporte para Access
+        support_info = access_reader.check_access_support()
+        if not support_info['supported']:
+            st.error("❌ Soporte para Access no disponible")
+            st.write(f"Error: {support_info['error_message']}")
+            return
+        
+        # Obtener tablas disponibles
+        available_tables = access_reader.get_table_names(file_path)
+        if not available_tables:
+            st.error("❌ No se detectaron tablas en el archivo Access")
+            return
+        
+        # Configurar MySQL si es necesario
+        mysql_writer = None
+        if "MySQL" in export_formats and mysql_config:
+            mysql_writer = MySQLWriter(mysql_config)
+            if not mysql_writer.test_connection():
+                st.error("❌ No se pudo conectar a MySQL")
+                return
+        
+        # Progreso de conversión
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        results_container = st.container()
+        
+        total_tables = len(available_tables)
+        all_results = []
+        integrity_reports = []
+        
+        status_text.text(f"🔄 Iniciando conversión mejorada de {total_tables} tablas...")
+        
+        for i, table_name in enumerate(available_tables):
+            try:
+                # Actualizar progreso
+                progress = (i / total_tables)
+                progress_bar.progress(progress)
+                status_text.text(f"📊 Procesando tabla {i+1}/{total_tables}: {table_name}")
+                
+                # Leer datos (con chunks si es necesario)
+                if use_chunks:
+                    df = access_reader.read_in_chunks(file_path, table_name, chunk_size=10000)
+                else:
+                    df = access_reader.read_table(file_path, table_name)
+                
+                if df is None or df.empty:
+                    st.warning(f"⚠️ Tabla '{table_name}' está vacía o no se pudo leer")
+                    continue
+                
+                # Calcular estadísticas originales para integridad
+                original_stats = integrity_checker.get_dataframe_stats(df)
+                
+                # Aplicar configuración de nombres
+                safe_table_name = apply_naming_config(table_name, naming_config)
+                
+                # Exportar según formatos seleccionados
+                table_results = []
+                
+                for format_type in export_formats:
+                    try:
+                        if format_type == "CSV":
+                            output_file = f"data/output/{safe_table_name}.csv"
+                            df.to_csv(output_file, index=False, encoding='utf-8')
+                            table_results.append({"format": "CSV", "file": output_file, "status": "✅"})
+                        
+                        elif format_type == "Excel":
+                            output_file = f"data/output/{safe_table_name}.xlsx"
+                            df.to_excel(output_file, index=False, engine='openpyxl')
+                            table_results.append({"format": "Excel", "file": output_file, "status": "✅"})
+                        
+                        elif format_type == "JSON":
+                            output_file = f"data/output/{safe_table_name}.json"
+                            df.to_json(output_file, orient='records', indent=2, force_ascii=False)
+                            table_results.append({"format": "JSON", "file": output_file, "status": "✅"})
+                        
+                        elif format_type == "MySQL" and mysql_writer:
+                            mysql_table_name = safe_table_name.lower()
+                            success = mysql_writer.write_dataframe(df, mysql_table_name)
+                            if success:
+                                table_results.append({"format": "MySQL", "table": mysql_table_name, "status": "✅"})
+                            else:
+                                table_results.append({"format": "MySQL", "table": mysql_table_name, "status": "❌"})
+                        
+                        # Verificar integridad para archivos exportados
+                        if format_type in ["CSV", "Excel"] and table_results:
+                            last_result = table_results[-1]
+                            if "file" in last_result:
+                                integrity_report = integrity_checker.verify_export_integrity(
+                                    df, last_result["file"], format_type.lower()
+                                )
+                                integrity_reports.append({
+                                    "table": table_name,
+                                    "format": format_type,
+                                    "report": integrity_report
+                                })
+                    
+                    except Exception as e:
+                        table_results.append({"format": format_type, "status": "❌", "error": str(e)})
+                
+                all_results.append({
+                    "table": table_name,
+                    "rows": len(df),
+                    "columns": len(df.columns),
+                    "results": table_results
+                })
+                
+            except Exception as e:
+                st.error(f"❌ Error procesando tabla '{table_name}': {str(e)}")
+                all_results.append({
+                    "table": table_name,
+                    "error": str(e),
+                    "results": []
+                })
+        
+        # Completar progreso
+        progress_bar.progress(1.0)
+        status_text.text("✅ Conversión completada")
+        
+        # Mostrar resultados
+        with results_container:
+            st.success(f"🎉 Conversión completada: {len(all_results)} tablas procesadas")
+            
+            # Resumen de resultados
+            for result in all_results:
+                with st.expander(f"📊 {result['table']} ({result.get('rows', 0)} filas)"):
+                    if "error" in result:
+                        st.error(f"❌ Error: {result['error']}")
+                    else:
+                        for export_result in result['results']:
+                            if export_result['status'] == "✅":
+                                if 'file' in export_result:
+                                    st.success(f"✅ {export_result['format']}: {export_result['file']}")
+                                elif 'table' in export_result:
+                                    st.success(f"✅ {export_result['format']}: tabla '{export_result['table']}'")
+                            else:
+                                error_msg = export_result.get('error', 'Error desconocido')
+                                st.error(f"❌ {export_result['format']}: {error_msg}")
+            
+            # Mostrar reportes de integridad
+            if integrity_reports:
+                st.markdown("### 🔍 Reportes de Integridad")
+                for report_data in integrity_reports:
+                    with st.expander(f"🔍 Integridad: {report_data['table']} ({report_data['format']})"):
+                        report = report_data['report']
+                        if report['integrity_passed']:
+                            st.success("✅ Integridad verificada correctamente")
+                        else:
+                            st.warning("⚠️ Se detectaron diferencias")
+                        
+                        st.write(f"**Filas originales:** {report['original_rows']}")
+                        st.write(f"**Filas exportadas:** {report['exported_rows']}")
+                        st.write(f"**Columnas originales:** {report['original_columns']}")
+                        st.write(f"**Columnas exportadas:** {report['exported_columns']}")
+                        
+                        if report['differences']:
+                            st.write("**Diferencias detectadas:**")
+                            for diff in report['differences']:
+                                st.write(f"- {diff}")
+    
+    except Exception as e:
+        st.error(f"❌ Error general en la conversión: {str(e)}")
+        st.exception(e)
+
+def apply_naming_config(original_name, naming_config):
+    """Aplica la configuración de nombres personalizada"""
+    if not naming_config:
+        return original_name.replace(' ', '_')
+    
+    import re
+    from datetime import datetime
+    
+    # Aplicar prefijo
+    name = original_name
+    if naming_config.get('table_prefix'):
+        name = f"{naming_config['table_prefix']}{name}"
+    
+    # Aplicar sufijo
+    if naming_config.get('table_suffix'):
+        name = f"{name}{naming_config['table_suffix']}"
+    
+    # Añadir timestamp si está configurado
+    if naming_config.get('use_timestamp'):
+        timestamp = datetime.now().strftime("_%Y%m%d_%H%M%S")
+        name = f"{name}{timestamp}"
+    
+    # Aplicar transformaciones de texto
+    if naming_config.get('lowercase_names', True):
+        name = name.lower()
+    
+    if naming_config.get('replace_spaces', True):
+        name = name.replace(' ', '_')
+    
+    # Limpiar caracteres adicionales
+    name = name.replace('-', '_')
+    
+    if naming_config.get('remove_special_chars', True):
+        # Mantener solo letras, números, guiones y guiones bajos
+        name = re.sub(r'[^a-zA-Z0-9_-]', '', name)
+    
+    return name
+
+
+def convert_to_mysql_by_year(file_path: str, db_config: dict, naming_config: dict) -> dict:
+    """
+    Convierte archivo Access por años directamente a MySQL
+    
+    Args:
+        file_path: Ruta del archivo Access
+        db_config: Configuración de la base de datos MySQL
+        naming_config: Configuración de nombres personalizados
+        
+    Returns:
+        Dict con resultado de la conversión
+    """
+    import streamlit as st
+    import re
+    from src.readers.robust_access_reader import RobustAccessReader
+    from src.writers.mysql_writer import MySQLWriter
+    
+    try:
+        # Conectar a MySQL
+        mysql_writer = MySQLWriter(db_config)
+        test_result = mysql_writer.test_connection()
+        
+        if not test_result['success']:
+            raise Exception(f"No se pudo conectar a MySQL: {test_result['message']}")
+        
+        st.info("✅ Conectado a MySQL exitosamente")
+        
+        # Obtener resumen de años
+        access_reader = RobustAccessReader()
+        year_summary = access_reader.get_year_summary(file_path)
+        
+        if 'error' in year_summary:
+            raise Exception(f"Error obteniendo resumen de años: {year_summary['error']}")
+        
+        # Contadores
+        total_tables_inserted = 0
+        total_rows_inserted = 0
+        conversions_by_year = {}
+        
+        # Procesar cada tabla y año
+        progress_bar = st.progress(0)
+        total_jobs = sum(
+            len(table_info.get('available_years', []))
+            for table_info in year_summary['tables'].values()
+            if 'error' not in table_info
+        )
+        current_job = 0
+        
+        for table_name, table_info in year_summary['tables'].items():
+            if 'error' in table_info:
+                st.warning(f"⚠️ Saltando tabla {table_name}: {table_info['error']}")
+                continue
+                
+            if not table_info.get('available_years'):
+                st.warning(f"⚠️ Tabla {table_name} no tiene años disponibles")
+                continue
+            
+            for year in table_info['available_years']:
+                try:
+                    current_job += 1
+                    progress_bar.progress(current_job / total_jobs)
+                    
+                    st.write(f"📊 Procesando tabla {table_name}, año {year}...")
+                    
+                    # Leer datos del año específico
+                    df = access_reader.read_by_year(file_path, table_name, year)
+                    
+                    if df.empty:
+                        st.warning(f"⚠️ No hay datos para {table_name}, año {year}")
+                        continue
+                    
+                    # Generar nombre de tabla personalizado
+                    if naming_config and (naming_config.get('table_prefix') or naming_config.get('table_suffix')):
+                        # Usar configuración personalizada
+                        table_base = table_name.lower() if naming_config.get('lowercase_names', True) else table_name
+                        
+                        if naming_config.get('table_prefix'):
+                            prefix = naming_config['table_prefix'].replace('{year}', str(year))
+                            mysql_table_name = f"{prefix}{table_base}"
+                        else:
+                            mysql_table_name = f"{table_base}_{year}"
+                            
+                        if naming_config.get('table_suffix'):
+                            suffix = naming_config['table_suffix'].replace('{year}', str(year))
+                            mysql_table_name = f"{mysql_table_name}{suffix}"
+                    else:
+                        # Nombre por defecto
+                        mysql_table_name = f"{table_name}_{year}".lower()
+                    
+                    # Limpiar nombre para MySQL
+                    mysql_table_name = mysql_table_name.replace('-', '_').replace(' ', '_')
+                    mysql_table_name = re.sub(r'[^a-zA-Z0-9_]', '', mysql_table_name)
+                    
+                    # Escribir a MySQL
+                    write_result = mysql_writer.write(
+                        df, 
+                        mysql_table_name,
+                        if_exists='replace'  # Reemplazar si existe
+                    )
+                    
+                    if write_result['success']:
+                        total_tables_inserted += 1
+                        total_rows_inserted += write_result['rows_written']
+                        
+                        conversions_by_year[f"{table_name}_{year}"] = {
+                            'table': table_name,
+                            'year': year,
+                            'mysql_table': mysql_table_name,
+                            'status': 'success',
+                            'rows_inserted': write_result['rows_written'],
+                            'columns': write_result['columns_written']
+                        }
+                        
+                        st.success(f"✅ {mysql_table_name}: {write_result['rows_written']:,} filas insertadas")
+                    else:
+                        st.error(f"❌ Error insertando {mysql_table_name}: {write_result.get('error', 'Error desconocido')}")
+                        conversions_by_year[f"{table_name}_{year}"] = {
+                            'table': table_name,
+                            'year': year,
+                            'mysql_table': mysql_table_name,
+                            'status': 'error',
+                            'error': write_result.get('error', 'Error desconocido')
+                        }
+                
+                except Exception as e:
+                    st.error(f"❌ Error procesando {table_name} año {year}: {str(e)}")
+                    conversions_by_year[f"{table_name}_{year}"] = {
+                        'table': table_name,
+                        'year': year,
+                        'status': 'error',
+                        'error': str(e)
+                    }
+        
+        # Cerrar conexión MySQL
+        mysql_writer.close()
+        
+        return {
+            'input_file': file_path,
+            'database_type': 'mysql',
+            'database_host': db_config['host'],
+            'database_name': db_config['database'],
+            'total_tables_inserted': total_tables_inserted,
+            'total_rows_inserted': total_rows_inserted,
+            'total_files_created': total_tables_inserted,  # Para compatibilidad con la interfaz
+            'total_rows_converted': total_rows_inserted,  # Para compatibilidad con la interfaz
+            'conversions_by_year': conversions_by_year
+        }
+        
+    except Exception as e:
+        st.error(f"❌ Error en conversión a MySQL: {str(e)}")
+        raise

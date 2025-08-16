@@ -32,6 +32,11 @@ class SQLWriter:
             Dict con información del resultado
         """
         try:
+            # Si se especifica batch_size, usar escritura en lotes para mejor rendimiento
+            batch_size = kwargs.get('batch_size')
+            if isinstance(batch_size, int) and batch_size > 0:
+                return self.write_batch_insert(df, output_path, table_name, batch_size=batch_size)
+
             self.logger.info(f"Escribiendo archivo SQL: {output_path}")
             
             # Generar SQL
@@ -86,9 +91,10 @@ class SQLWriter:
         for col_name, dtype in df.dtypes.items():
             # Mapear tipos de pandas a SQL
             sql_type = self._map_pandas_to_sql_type(dtype)
-            columns.append(f'    "{col_name}" {sql_type}')
+            # Usar backticks para MySQL, comillas dobles para otros
+            columns.append(f'    `{col_name}` {sql_type}')
         
-        create_sql = f"CREATE TABLE IF NOT EXISTS {table_name} (\n"
+        create_sql = f"CREATE TABLE IF NOT EXISTS `{table_name}` (\n"
         create_sql += ",\n".join(columns)
         create_sql += "\n);"
         
@@ -106,7 +112,7 @@ class SQLWriter:
             Lista de statements INSERT
         """
         insert_statements = []
-        columns = [f'"{col}"' for col in df.columns]
+        columns = [f'`{col}`' for col in df.columns]
         columns_str = ', '.join(columns)
         
         for _, row in df.iterrows():
@@ -123,7 +129,7 @@ class SQLWriter:
                     values.append(f"'{escaped_val}'")
             
             values_str = ', '.join(values)
-            insert_sql = f"INSERT INTO {table_name} ({columns_str}) VALUES ({values_str});"
+            insert_sql = f"INSERT INTO `{table_name}` ({columns_str}) VALUES ({values_str});"
             insert_statements.append(insert_sql)
         
         return insert_statements
