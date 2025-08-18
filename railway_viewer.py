@@ -106,6 +106,33 @@ def main():
             st.warning("No hay tablas disponibles")
             return
         
+        # Acción para recalcular conteos exactos de TODAS las tablas
+        if st.button("🔄 Recalcular conteos exactos de todas las tablas"):
+            try:
+                with st.spinner("🧮 Calculando conteos exactos de todas las tablas..."):
+                    mysql_writer = st.session_state.mysql_writer
+                    from sqlalchemy import text
+                    refreshed = []
+                    total_exact = 0
+                    with mysql_writer.engine.connect() as conn:
+                        for t in tables_data['tables']:
+                            name = t['name']
+                            try:
+                                exact = conn.execute(text(f"SELECT COUNT(*) FROM `{name}`")).scalar()
+                                exact_int = int(exact or 0)
+                            except Exception:
+                                exact_int = int(t.get('count') or 0)
+                            refreshed.append({'name': name, 'count': exact_int})
+                            total_exact += exact_int
+                    st.session_state.tables_data = {
+                        'tables': refreshed,
+                        'total_rows': total_exact
+                    }
+                st.success("Conteos exactos actualizados")
+                st.rerun()
+            except Exception as e:
+                st.error(f"No se pudieron recalcular los conteos: {e}")
+
         st.markdown(f"**📋 Encontradas {len(tables_data['tables'])} tablas:**")
         
         # Mostrar resumen de tablas sin recargar
@@ -129,6 +156,29 @@ def main():
         
         if selected_table:
             mysql_writer = st.session_state.mysql_writer
+            
+            # Calcular conteo exacto automáticamente al seleccionar la tabla
+            auto_exact_key = f"exact_count_{selected_table}"
+            # Recalcular si nunca se calculó o si cambió la tabla
+            if st.session_state.get('last_selected_table') != selected_table:
+                st.session_state['last_selected_table'] = selected_table
+                st.session_state[auto_exact_key] = None
+            
+            if st.session_state.get(auto_exact_key) is None:
+                with st.spinner(f"🧮 Calculando conteo exacto de {selected_table}..."):
+                    try:
+                        from sqlalchemy import text
+                        with mysql_writer.engine.connect() as conn:
+                            exact_total = conn.execute(text(f"SELECT COUNT(*) FROM `{selected_table}`")).scalar()
+                        st.session_state[auto_exact_key] = int(exact_total)
+                        # Actualizar cache de tablas y total global
+                        for t in tables_data['tables']:
+                            if t['name'] == selected_table:
+                                t['count'] = st.session_state[auto_exact_key]
+                                break
+                        tables_data['total_rows'] = sum(t['count'] for t in tables_data['tables'])
+                    except Exception as e:
+                        st.warning(f"No se pudo obtener conteo exacto: {e}")
             
             # Cache para estructura de tabla
             cache_key = f"structure_{selected_table}"
@@ -169,10 +219,11 @@ def main():
                 
                 # Calcular offset para paginación
                 import math
-                # Usar conteo aproximado disponible para calcular páginas
+                # Usar conteo exacto si ya fue calculado; sino aproximado
                 table_info = next(t for t in tables_data['tables'] if t['name'] == selected_table)
-                approx_total = int(table_info['count']) if table_info['count'] is not None else 0
-                total_pages = max(1, math.ceil(approx_total / page_size)) if approx_total > 0 else 1
+                exact_total_val = st.session_state.get(auto_exact_key)
+                effective_total = int(exact_total_val) if exact_total_val is not None else int(table_info['count'] or 0)
+                total_pages = max(1, math.ceil(effective_total / page_size)) if effective_total > 0 else 1
                 current_page = min(page_number, total_pages)
                 offset = (current_page - 1) * page_size
                 
@@ -192,7 +243,7 @@ def main():
                             'table_name': selected_table,
                             'page_size': page_size,
                             'page': current_page,
-                            'approx_total': approx_total,
+                            'total_rows_effective': effective_total,
                             'total_pages': total_pages
                         }
                     
@@ -224,33 +275,14 @@ def main():
                             with col2:
                                 st.metric("Columnas", len(df.columns))
                             with col3:
-                                # Mostrar total aproximado para evitar COUNT(*) costoso
-                                st.metric("Total en tabla (aprox.)", f"{current_data['approx_total']:,}")
+                                st.metric("Total en tabla (exacto)", f"{current_data['total_rows_effective']:,}")
                             
-                            # Mostrar paginación y acción para conteo exacto opcional
+                            # Mostrar paginación y notas
                             colp1, colp2, colp3 = st.columns(3)
                             with colp1:
                                 st.caption(f"Página {current_data['page']} de {current_data['total_pages']}")
                             with colp2:
-                                st.caption("Usando conteo aproximado de information_schema")
-                            with colp3:
-                                if st.button("🔄 Actualizar conteo exacto"):
-                                    try:
-                                        with mysql_writer.engine.connect() as conn:
-                                            from sqlalchemy import text
-                                            exact_result = conn.execute(text(f"SELECT COUNT(*) FROM `{current_data['table_name']}`"))
-                                            exact_total = exact_result.fetchone()[0]
-                                            # Actualizar cache de tablas (solo este registro)
-                                            for t in st.session_state.tables_data['tables']:
-                                                if t['name'] == current_data['table_name']:
-                                                    t['count'] = exact_total
-                                                    break
-                                            st.session_state.tables_data['total_rows'] = sum(t['count'] for t in st.session_state.tables_data['tables'])
-                                            # Refrescar vista
-                                            st.success(f"Conteo exacto: {exact_total:,}")
-                                            st.rerun()
-                                    except Exception as e:
-                                        st.error(f"No se pudo calcular el conteo exacto: {str(e)}")
+                                st.caption("Mostrando conteo exacto")
                                 
     except Exception as e:
         st.error(f"❌ Error: {str(e)}")
